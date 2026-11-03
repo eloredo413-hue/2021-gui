@@ -45,12 +45,26 @@ local USE_MAIN_BRANCH_IF_NO_FIX = true
 local USE_2017_CHAT = true
 local CHAT_OPEN_AT_START = false
 
+-- ============================================================
+-- LEAVE / RESET CONFIRMATION PAGES (2019 ESC menu)
+--
+-- MATCH_LEAVE_TO_RESET: the "Are you sure you want to leave the game?" page is laid
+--   out exactly like "Are you sure you want to reset your character?" (same question
+--   position and size, same button positions and gap).
+-- FIRST_BUTTON_BLUE: the first button of both pages ("Leave" and "Reset") is always
+--   blue, as soon as the page opens, on touch screens too.
+-- ============================================================
+local MATCH_LEAVE_TO_RESET = true
+local FIRST_BUTTON_BLUE = true
+
 local scriptToRun = "local SHOW_STATUS = " .. tostring(SHOW_STATUS) .. "\n"
     .. "local SHOW_LOADED = " .. tostring(SHOW_LOADED) .. "\n"
     .. "local SHOW_HUD = " .. tostring(SHOW_HUD) .. "\n"
     .. "local USE_MAIN_BRANCH_IF_NO_FIX = " .. tostring(USE_MAIN_BRANCH_IF_NO_FIX) .. "\n"
     .. "local USE_2017_CHAT = " .. tostring(USE_2017_CHAT) .. "\n"
     .. "local CHAT_OPEN_AT_START = " .. tostring(CHAT_OPEN_AT_START) .. "\n"
+    .. "local MATCH_LEAVE_TO_RESET = " .. tostring(MATCH_LEAVE_TO_RESET) .. "\n"
+    .. "local FIRST_BUTTON_BLUE = " .. tostring(FIRST_BUTTON_BLUE) .. "\n"
     .. [=[
     local Env = (getgenv and getgenv()) or _G
     local STATUS_GUI_NAME = "Legacy2019StatusGui"
@@ -167,6 +181,212 @@ local scriptToRun = "local SHOW_STATUS = " .. tostring(SHOW_STATUS) .. "\n"
         end)
     end
 
+    ----------------------------------------------------------------
+    -- Leave / Reset confirmation pages of the 2019 ESC menu.
+    --
+    -- The two pages are built separately and came out different: the
+    -- Leave page sat lower, with its buttons closer together. The
+    -- Reset page is the one to follow, so the Leave page copies its
+    -- layout (page size, question, button positions and sizes).
+    -- The first button of each page ("Leave", "Reset") is kept blue,
+    -- whatever the menu does to it (hover, selection, the touch-screen
+    -- clean-up that turns blue buttons grey again).
+    --
+    -- The pages are found by their text, so this does not depend on
+    -- how the menu names them. A page that is not on screen is
+    -- unparented by the menu; it is still found through the menu's
+    -- module records, or the nil instances.
+    ----------------------------------------------------------------
+    local BLUE_BUTTON = "rbxasset://textures/ui/Settings/MenuBarAssets/MenuButtonSelected.png"
+
+    local QUESTIONS = {
+        leave = { question = "leave the game", confirm = "leave" },
+        reset = { question = "reset your character", confirm = "reset" },
+    }
+
+    local function textOf(object)
+        local ok, text = pcall(function() return object.Text end)
+        if ok and type(text) == "string" then
+            return (text:lower():match("^%s*(.-)%s*$"))
+        end
+        return nil
+    end
+
+    local function isQuestion(object, kind)
+        if not object:IsA("TextLabel") then return false end
+        local text = textOf(object)
+        return text ~= nil and text:find(QUESTIONS[kind].question, 1, true) ~= nil
+    end
+
+    -- The question, the page it sits on, and the two buttons.
+    local function findParts(root, kind)
+        local question = nil
+        if isQuestion(root, kind) then
+            question = root
+        else
+            for _, d in ipairs(root:GetDescendants()) do
+                if isQuestion(d, kind) then question = d break end
+            end
+        end
+        local page = question and question.Parent
+        if not page then return nil end
+
+        local word = QUESTIONS[kind].confirm
+        local confirm, cancel = nil, nil
+        for _, d in ipairs(page:GetDescendants()) do
+            if d:IsA("GuiButton") and not (confirm and confirm:IsAncestorOf(d))
+               and not (cancel and cancel:IsAncestorOf(d)) then
+                local texts = { textOf(d) }
+                for _, c in ipairs(d:GetDescendants()) do
+                    local text = (c:IsA("TextLabel") or c:IsA("TextButton")) and textOf(c)
+                    if text then table.insert(texts, text) end
+                end
+                for _, text in ipairs(texts) do
+                    if text == word then
+                        confirm = confirm or d
+                    elseif text:find("^don") and text:find(word, 1, true) then
+                        cancel = cancel or d
+                    end
+                end
+            end
+        end
+        if not confirm then return nil end
+        return { page = page, question = question, confirm = confirm, cancel = cancel }
+    end
+
+    local function stillValid(parts, kind)
+        return parts ~= nil and parts.question.Parent == parts.page
+            and isQuestion(parts.question, kind)
+            and parts.confirm:IsDescendantOf(parts.page)
+    end
+
+    -- Places to look: the menu's gui, the menu's modules (the pages and the hub
+    -- keep their page frames), and the objects with no parent.
+    local function searchRoots(menuGui)
+        local roots = {}
+        if menuGui and menuGui.Parent then table.insert(roots, menuGui) end
+        pcall(function()
+            local records = Env.__rbxm_suite_modules
+            if type(records) ~= "table" then return end
+            local function addPage(value)
+                if type(value) == "table" and typeof(rawget(value, "Page")) == "Instance" then
+                    table.insert(roots, rawget(value, "Page"))
+                end
+            end
+            for module, record in pairs(records) do
+                if typeof(module) == "Instance" and type(record) == "table"
+                   and (module.Name == "LeaveGame" or module.Name == "ResetCharacter"
+                        or module.Name == "SettingsHub") then
+                    local data = rawget(record, "data")
+                    addPage(data)
+                    local hub = type(data) == "table" and rawget(data, "Instance")
+                    if type(hub) == "table" then
+                        for _, value in pairs(hub) do addPage(value) end
+                    end
+                end
+            end
+        end)
+        pcall(function()
+            if type(getnilinstances) ~= "function" then return end
+            for _, object in ipairs(getnilinstances()) do
+                if typeof(object) == "Instance" and object:IsA("GuiObject") then
+                    table.insert(roots, object)
+                end
+            end
+        end)
+        return roots
+    end
+
+    local function copyProps(from, to, props)
+        for _, prop in ipairs(props) do
+            pcall(function()
+                local value = from[prop]
+                if to[prop] ~= value then to[prop] = value end
+            end)
+        end
+    end
+
+    local function makeBlue(button)
+        pcall(function()
+            if button:IsA("ImageButton") and button.Image ~= BLUE_BUTTON then
+                button.Image = BLUE_BUTTON
+            end
+        end)
+    end
+
+    local function matchLeaveToReset(leave, reset)
+        copyProps(reset.page, leave.page, { "Size" })
+        copyProps(reset.question, leave.question, {
+            "AnchorPoint", "Position", "Size", "TextSize", "TextScaled", "TextWrapped",
+            "TextXAlignment", "TextYAlignment",
+        })
+        for _, pair in ipairs({ { leave.confirm, reset.confirm }, { leave.cancel, reset.cancel } }) do
+            local mine, theirs = pair[1], pair[2]
+            if mine and theirs then
+                -- The buttons hang off the same element as on the Reset page.
+                if theirs.Parent == reset.question and mine.Parent ~= leave.question then
+                    mine.Parent = leave.question
+                elseif theirs.Parent == reset.page and mine.Parent ~= leave.page then
+                    mine.Parent = leave.page
+                end
+                copyProps(theirs, mine, { "AnchorPoint", "Position", "Size" })
+            end
+        end
+    end
+
+    local function startConfirmPageFix()
+        if not (MATCH_LEAVE_TO_RESET or FIRST_BUTTON_BLUE) then return end
+        local RunService = game:GetService("RunService")
+        local found = { leave = nil, reset = nil }
+
+        task.spawn(function()
+            local warned, started = false, os.clock()
+            while Env.Legacy2019Menu do
+                local missing = false
+                for kind in pairs(QUESTIONS) do
+                    if not stillValid(found[kind], kind) then
+                        found[kind] = nil
+                        missing = true
+                    end
+                end
+                if missing then
+                    local menuGui = game:GetService("CoreGui"):FindFirstChild("NewRobloxGui")
+                    for _, root in ipairs(searchRoots(menuGui)) do
+                        for kind in pairs(QUESTIONS) do
+                            if not found[kind] then
+                                local ok, parts = pcall(findParts, root, kind)
+                                if ok and parts then
+                                    found[kind] = parts
+                                    print("[Payload] " .. kind .. " page found:", parts.page:GetFullName())
+                                end
+                            end
+                        end
+                        if found.leave and found.reset then break end
+                    end
+                    if not (found.leave and found.reset) and not warned and os.clock() - started > 30 then
+                        warned = true
+                        warn("[Payload] leave / reset pages not found yet (leave: "
+                            .. tostring(found.leave ~= nil) .. ", reset: " .. tostring(found.reset ~= nil) .. ")")
+                    end
+                end
+                -- (looking through every object with no parent is not free: slower after a while)
+                task.wait(missing and (os.clock() - started > 30 and 5 or 0.5) or 2)
+            end
+        end)
+
+        -- Every frame, before it is drawn: whatever changed them since is put back.
+        RunService.RenderStepped:Connect(function()
+            local leave, reset = found.leave, found.reset
+            if MATCH_LEAVE_TO_RESET and leave and reset then
+                matchLeaveToReset(leave, reset)
+            end
+            if FIRST_BUTTON_BLUE then
+                if leave then makeBlue(leave.confirm) end
+                if reset then makeBlue(reset.confirm) end
+            end
+        end)
+    end
+
     print("[Payload] started")
 
     -- 1. Load the 2019 ESC Menu (the Roblox logo opens it) and show which build is running.
@@ -257,7 +477,10 @@ local scriptToRun = "local SHOW_STATUS = " .. tostring(SHOW_STATUS) .. "\n"
                 else
                     showStatus("2019 ESC menu " .. tostring(menuTag) .. " loaded", GREEN, 8)
                 end
-                if ran then startHud(menuStatusText) end
+                if ran then
+                    startHud(menuStatusText)
+                    startConfirmPageFix()
+                end
             end
         end
         print("[Payload] 2019 ESC menu loaded")
